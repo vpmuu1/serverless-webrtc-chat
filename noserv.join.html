@@ -32,7 +32,7 @@ var iceServers = {
 
 var pc = new RTCPeerConnection(iceServers);  
 var sdpConstraints = { optional: [{RtpDataChannels: true}]  };
-var pc = new RTCPeerConnection(server);
+//var pc = new RTCPeerConnection(server);
 var dc;
 
 pc.ondatachannel  = function(e) {dc = e.channel; dcInit(dc)};
