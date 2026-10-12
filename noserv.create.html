@@ -21,8 +21,16 @@
 </div>
 <script>
 var server       = { urls: "stun:stun.miwifi.com:3478" };
+var iceServers = {
+  iceServers: [
+    { urls: "stun:stun.miwifi.com:3478" },
+    { urls: "stun:stun.chat.bilibili.com:3478" }
+  ]
+};
+
+var pc = new RTCPeerConnection(iceServers);
 var sdpConstraints = { optional: [{RtpDataChannels: true}]  };
-var pc = new RTCPeerConnection(server);
+//var pc = new RTCPeerConnection(server);
 var dc;
 
 pc.oniceconnectionstatechange = function(e) {
