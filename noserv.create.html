@@ -2,85 +2,259 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title> CREATE WebRTC channel </title>
-  <link href="noserv.css" rel="stylesheet">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.1.1/jquery.min.js"></script>
+  <title>CREATE WebRTC channel (Metered Realtime)</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 24px auto; padding: 0 16px; }
+    h2 { margin-bottom: 8px; }
+    #status { font-weight: normal; color: #666; }
+    input[type=text] { width: 100%; box-sizing: border-box; padding: 8px; margin: 4px 0 12px; font-family: monospace; }
+    button { padding: 8px 16px; cursor: pointer; margin-right: 8px; }
+    #chat { border: 1px solid #ccc; border-radius: 8px; overflow: hidden; margin-top: 16px; }
+    #chat-screen-wp { height: 280px; overflow-y: auto; background: #fafafa; padding: 8px; }
+    .wrap { margin: 6px 0; }
+    .me .msg { background: #dcf8c6; }
+    .other .msg { background: #fff; border: 1px solid #ddd; }
+    .info .msg { background: #e8f0fe; color: #1a73e8; }
+    .who { font-size: 11px; color: #888; margin-right: 6px; }
+    .msg { display: inline-block; padding: 6px 10px; border-radius: 12px; max-width: 80%; word-break: break-word; }
+    #ct { display: flex; gap: 8px; padding: 8px; border-top: 1px solid #eee; }
+    #ct input { flex: 1; }
+    .hint { font-size: 13px; color: #666; margin-bottom: 12px; }
+    .log { font-size: 12px; color: #888; margin-top: 8px; white-space: pre-wrap; max-height: 160px; overflow-y: auto; }
+  </style>
 </head>
 <body>
-<h2> CREATE WebRTC channel <span id="status"> init </span></h2>
-<h3> 1.CREATE Offer's SDP </h3>
-<textarea id="creater-sdp"></textarea>
-<h3> 4.GET Participant's SDP <button id="start">start</button></h3>
-<textarea id="joiner-sdp" placeholder="HERE COPY AND PASTE [3.Participant'S SDP]"></textarea>
-<h3> CHAT </h3>
+<h2>CREATE WebRTC channel <span id="status">init</span></h2>
+<p class="hint">
+  双方填写<strong>相同房间号</strong>。先点「创建并等待」，再让对方点「加入」。Offer/Answer 会通过 Metered Realtime 自动交换。
+</p>
+
+<label>API Key (pk_live_...)</label>
+<input type="text" id="api-key" placeholder="pk_live_xxxxxxxxxxxxxxxx" value="pk_live_814d2405fac2153e1872893be10bdd637233c5ac">
+
+<label>房间号 (双方相同)</label>
+<input type="text" id="room-id" placeholder="例如 demo-room-123" value="demo-room-1">
+
+<button id="btn-create">创建并等待对方加入</button>
+<button id="btn-resend" disabled>重新发送 Offer</button>
+
+<h3>CHAT</h3>
 <div id="chat">
-  <div id="chat-screen-wp">
-    <div id="chat-screen"></div>
+  <div id="chat-screen-wp"><div id="chat-screen"></div></div>
+  <div id="ct">
+    <input id="msg" disabled placeholder="连接成功后可聊天">
+    <button id="send" disabled>send</button>
   </div>
-  <div id="ct"><input id="msg" disabled><button id="send" disabled>send</button></div>
 </div>
+<div class="log" id="log"></div>
+
 <script>
-var server       = { urls: "stun:stun.miwifi.com:3478" };
-var iceServers = {
+const DEFAULT_API_KEY = "pk_live_814d2405fac2153e1872893be10bdd637233c5ac";
+
+let pc = null;
+let dc = null;
+let ws = null;
+let myPeerId = null;
+let roomChannel = null;
+let localSdpSent = false;
+let iceConfig = {
   iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun.miwifi.com:3478" },
     { urls: "stun:stun.chat.bilibili.com:3478" }
   ]
 };
 
-var pc = new RTCPeerConnection(iceServers);
-var sdpConstraints = { optional: [{RtpDataChannels: true}]  };
-//var pc = new RTCPeerConnection(server);
-var dc;
-
-pc.oniceconnectionstatechange = function(e) {
-  var state = pc.iceConnectionState;
-  $('#status').html(state);
-  if (state == "connected") $("#msg, #send").attr("disabled", false);
-};
-pc.onicecandidate = function(e) {
-  if (e.candidate) return;
-  $("#creater-sdp").val(JSON.stringify(pc.localDescription));
+function log(msg) {
+  console.log(msg);
+  const el = document.getElementById("log");
+  el.textContent += new Date().toLocaleTimeString() + "  " + msg + "\n";
+  el.scrollTop = 99999;
+}
+function setStatus(s) { document.getElementById("status").textContent = s; }
+function addMSG(msg, who) {
+  const wrap = document.createElement("div");
+  wrap.className = "wrap";
+  const div = document.createElement("div");
+  div.className = who;
+  div.innerHTML = `<span class="who">${who}</span><span class="msg">${msg}</span>`;
+  wrap.appendChild(div);
+  document.getElementById("chat-screen").appendChild(wrap);
+  document.getElementById("chat-screen-wp").scrollTop = 99999;
+}
+function enableChat() {
+  document.getElementById("msg").disabled = false;
+  document.getElementById("send").disabled = false;
 }
 
-function createOfferSDP() {
-  dc = pc.createDataChannel("chat");
-  pc.createOffer().then(function(e) {
-    pc.setLocalDescription(e)
+function connectSignaling(apiKey, roomId) {
+  return new Promise((resolve, reject) => {
+    const url = `wss://rms.metered.ca/v1?key=${encodeURIComponent(apiKey)}`;
+    ws = new WebSocket(url);
+
+    ws.onopen = () => { setStatus("ws-open"); log("WebSocket opened"); };
+
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      log("← " + msg.type + (msg.data && msg.data.kind ? " (" + msg.data.kind + ")" : ""));
+
+      if (msg.type === "welcome") {
+        myPeerId = msg.peerId;
+        if (msg.metadata && Array.isArray(msg.metadata.iceServers) && msg.metadata.iceServers.length) {
+          iceConfig.iceServers = msg.metadata.iceServers;
+          log("using Metered iceServers (" + iceConfig.iceServers.length + ")");
+        }
+        setStatus("welcome " + myPeerId);
+        roomChannel = "webrtc-chat/" + roomId;
+        ws.send(JSON.stringify({ type: "subscribe", channel: roomChannel, requestId: "sub-1" }));
+      }
+
+      if (msg.type === "ack" && msg.requestId === "sub-1") {
+        setStatus("subscribed");
+        log("subscribed to " + roomChannel);
+        resolve();
+      }
+
+      if (msg.type === "error") {
+        log("ERROR: " + (msg.message || msg.code));
+        addMSG("信令错误: " + (msg.message || msg.code), "info");
+      }
+
+      // 有人加入 → 重新发送 Offer（解决后加入收不到历史消息）
+      if (msg.type === "presence" && msg.joined && msg.joined.length) {
+        const others = msg.joined.filter(p => p.peerId !== myPeerId);
+        if (others.length && pc && pc.localDescription) {
+          log("presence: someone joined, re-send offer");
+          sendLocalSdp("offer");
+        }
+      }
+
+      if (msg.type === "message" && msg.data && msg.data.kind === "answer") {
+        handleRemoteAnswer(msg.data.sdp);
+      }
+    };
+
+    ws.onerror = (e) => { setStatus("ws-error"); log("ws error"); reject(e); };
+    ws.onclose = (e) => { setStatus("ws-closed " + e.code); log("ws closed " + e.code); };
   });
-  dc.onopen = function(){$("textarea").attr("disabled",true);addMSG("CONNECTED!", "info")};
-  dc.onmessage = function(e) {
-    if (e.data) addMSG(e.data, "other");
+}
+
+function publish(data) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({
+    type: "publish",
+    channel: roomChannel,
+    data: data,
+    requestId: "pub-" + Date.now()
+  }));
+  log("→ publish " + data.kind);
+}
+
+function sendLocalSdp(kind) {
+  if (!pc || !pc.localDescription) return;
+  const sdp = JSON.stringify(pc.localDescription);
+  publish({ kind: kind, sdp: sdp, from: myPeerId });
+  localSdpSent = true;
+  setStatus(kind + " sent");
+  addMSG(kind + " 已发送", "info");
+}
+
+function createPeerConnection() {
+  pc = new RTCPeerConnection(iceConfig);
+  localSdpSent = false;
+
+  pc.oniceconnectionstatechange = () => {
+    const state = pc.iceConnectionState;
+    setStatus(state);
+    log("iceConnectionState = " + state);
+    if (state === "connected" || state === "completed") enableChat();
+  };
+
+  pc.onicegatheringstatechange = () => {
+    log("iceGatheringState = " + pc.iceGatheringState);
+    if (pc.iceGatheringState === "complete" && !localSdpSent) {
+      sendLocalSdp("offer");
+    }
+  };
+
+  // 兜底：2 秒后强制发送（防止 gathering 卡住）
+  setTimeout(() => {
+    if (!localSdpSent && pc && pc.localDescription) {
+      log("timeout → force send offer");
+      sendLocalSdp("offer");
+    }
+  }, 2000);
+
+  dc = pc.createDataChannel("chat");
+  dc.onopen = () => { addMSG("CONNECTED!", "info"); enableChat(); log("DataChannel open"); };
+  dc.onmessage = (e) => { if (e.data) addMSG(e.data, "other"); };
+  dc.onclose = () => addMSG("DataChannel closed", "info");
+}
+
+async function createOffer() {
+  createPeerConnection();
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    log("setLocalDescription(offer) done, waiting ICE…");
+  } catch (err) {
+    log("createOffer failed: " + err.message);
+    addMSG("createOffer 失败: " + err.message, "info");
   }
-};
-
-function start() {
-  var answerSDP = $('#joiner-sdp').val()
-  var answerDesc = new RTCSessionDescription(JSON.parse(answerSDP));
-  pc.setRemoteDescription(answerDesc);
 }
 
-var addMSG = function(msg, who) {
-  var wrap = $("<div>").addClass("wrap").appendTo($("#chat-screen"));
-  var div  = $("<div>").addClass(who).appendTo(wrap);
-  $("<span>").html(who).addClass("who").appendTo(div);
-  $("<span>").html(msg).addClass("msg").appendTo(div);
-  $("#chat-screen-wp").scrollTop($("#chat-screen").height());
+async function handleRemoteAnswer(sdpStr) {
+  try {
+    const answerDesc = new RTCSessionDescription(JSON.parse(sdpStr));
+    await pc.setRemoteDescription(answerDesc);
+    setStatus("answer applied");
+    addMSG("已收到 Answer，正在建立连接…", "info");
+    log("setRemoteDescription(answer) ok");
+  } catch (err) {
+    log("setRemoteDescription failed: " + err.message);
+    addMSG("设置 Answer 失败: " + err.message, "info");
+  }
 }
 
-createOfferSDP();
-
-var sendMSG = function() {
-  var value = $("#msg").val();
-  if (value) {
+function sendMSG() {
+  const value = document.getElementById("msg").value.trim();
+  if (value && dc && dc.readyState === "open") {
     dc.send(value);
     addMSG(value, "me");
-    $("#msg").val('');
+    document.getElementById("msg").value = "";
   }
 }
-$("#start").click(function(){start();});
-$("#msg").keypress(function(e) {if(e.which == 13) {sendMSG()}});
-$("#send").click(sendMSG);
+
+document.getElementById("btn-create").onclick = async () => {
+  const apiKey = document.getElementById("api-key").value.trim() || DEFAULT_API_KEY;
+  const roomId = document.getElementById("room-id").value.trim();
+  if (!roomId) { alert("请填写房间号"); return; }
+  if (apiKey.includes("REPLACE_ME")) {
+    alert("请先填写真实的 pk_live_... API Key（Dashboard 创建并勾选 Send）");
+    return;
+  }
+
+  document.getElementById("btn-create").disabled = true;
+  document.getElementById("btn-resend").disabled = false;
+  setStatus("connecting…");
+
+  try {
+    await connectSignaling(apiKey, roomId);
+    await createOffer();
+  } catch (e) {
+    setStatus("failed");
+    addMSG("连接信令失败，请检查 API Key 和网络", "info");
+    document.getElementById("btn-create").disabled = false;
+  }
+};
+
+document.getElementById("btn-resend").onclick = () => {
+  if (pc && pc.localDescription) sendLocalSdp("offer");
+};
+
+document.getElementById("msg").onkeypress = (e) => { if (e.which === 13) sendMSG(); };
+document.getElementById("send").onclick = sendMSG;
 </script>
 </body>
 </html>
