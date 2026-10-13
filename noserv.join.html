@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>JOIN WebRTC channel (Socket.io)</title>
+  <title>JOIN WebRTC channel (Socket.io) + 连接诊断</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 720px; margin: 24px auto; padding: 0 16px; }
     h2 { margin-bottom: 8px; }
@@ -20,7 +20,17 @@
     #ct { display: flex; gap: 8px; padding: 8px; border-top: 1px solid #eee; }
     #ct input { flex: 1; }
     .hint { font-size: 13px; color: #666; margin-bottom: 12px; }
-    .log { font-size: 12px; color: #888; margin-top: 8px; white-space: pre-wrap; max-height: 160px; overflow-y: auto; }
+    .log { font-size: 12px; color: #888; margin-top: 8px; white-space: pre-wrap; max-height: 220px; overflow-y: auto; background:#0b1120; color:#e2e8f0; padding:8px; border-radius:8px; }
+    .log .time { color:#64748b; }
+    .tag { font-weight:600; padding:0 4px; border-radius:3px; font-size:11px; }
+    .tag-host { background:#1e3a5f; color:#93c5fd; }
+    .tag-srflx { background:#2d3a1e; color:#bef264; }
+    .tag-relay { background:#4a1e1e; color:#fca5a5; }
+    .tag-prflx { background:#3a2e1e; color:#fdba74; }
+    #path-banner { margin-top:12px; padding:10px 14px; border-radius:10px; display:none; font-weight:600; }
+    #path-banner.direct { background:#f0fdf4; border-left:5px solid #22c55e; color:#166534; }
+    #path-banner.turn { background:#fef2f2; border-left:5px solid #ef4444; color:#991b1b; }
+    #path-banner.mixed { background:#fffbeb; border-left:5px solid #f59e0b; color:#92400e; }
   </style>
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 </head>
@@ -37,6 +47,8 @@
 <input type="text" id="room-id" value="demo-room-1">
 
 <button id="btn-join">加入房间</button>
+
+<div id="path-banner"></div>
 
 <h3>CHAT</h3>
 <div id="chat">
@@ -61,33 +73,28 @@ const iceConfig = {
   iceServers: [
     { urls: "stun:stun.miwifi.com:3478" },
     { urls: "stun:stun.chat.bilibili.com:3478" },
-    {
-      urls: "turn:global.relay.metered.ca:80",
-      username: "3043870328f476eb7b83f1f5",
-      credential: "SqE9Pbn6+saRzOZS",
-    },
-    {
-      urls: "turn:global.relay.metered.ca:80?transport=tcp",
-      username: "3043870328f476eb7b83f1f5",
-      credential: "SqE9Pbn6+saRzOZS",
-    },
-    {
-      urls: "turn:global.relay.metered.ca:443",
-      username: "3043870328f476eb7b83f1f5",
-      credential: "SqE9Pbn6+saRzOZS",
-    },
-    {
-      urls: "turns:global.relay.metered.ca:443?transport=tcp",
-      username: "3043870328f476eb7b83f1f5",
-      credential: "SqE9Pbn6+saRzOZS",
-    },
+    { urls: "turn:global.relay.metered.ca:80", username: "3043870328f476eb7b83f1f5", credential: "SqE9Pbn6+saRzOZS" },
+    { urls: "turn:global.relay.metered.ca:80?transport=tcp", username: "3043870328f476eb7b83f1f5", credential: "SqE9Pbn6+saRzOZS" },
+    { urls: "turn:global.relay.metered.ca:443", username: "3043870328f476eb7b83f1f5", credential: "SqE9Pbn6+saRzOZS" },
+    { urls: "turns:global.relay.metered.ca:443?transport=tcp", username: "3043870328f476eb7b83f1f5", credential: "SqE9Pbn6+saRzOZS" },
   ]
 };
 
-function log(msg) {
+function log(msg, tag) {
   console.log(msg);
   const el = document.getElementById("log");
-  el.textContent += new Date().toLocaleTimeString() + "  " + msg + "\n";
+  const time = new Date().toLocaleTimeString('en-GB', { hour12: false });
+  let tagHtml = '';
+  if (tag) {
+    const map = {
+      host: '<span class="tag tag-host">host</span>',
+      srflx: '<span class="tag tag-srflx">srflx</span>',
+      relay: '<span class="tag tag-relay">relay</span>',
+      prflx: '<span class="tag tag-prflx">prflx</span>',
+    };
+    tagHtml = map[tag] || `<span class="tag">${tag}</span>`;
+  }
+  el.innerHTML += `<span class="time">${time}</span>  ${msg} ${tagHtml}\n`;
   el.scrollTop = 99999;
 }
 function setStatus(s) { document.getElementById("status").textContent = s; }
@@ -104,6 +111,14 @@ function addMSG(msg, who) {
 function enableChat() {
   document.getElementById("msg").disabled = false;
   document.getElementById("send").disabled = false;
+}
+
+function parseCandidateType(candidateStr) {
+  if (!candidateStr) return null;
+  const parts = candidateStr.split(' ');
+  const idx = parts.indexOf('typ');
+  if (idx !== -1 && parts[idx + 1]) return parts[idx + 1];
+  return null;
 }
 
 async function addRemoteCandidate(cand) {
@@ -186,12 +201,57 @@ function sendLocalSdp(kind) {
   log("→ " + kind);
 }
 
+// 连接成功后，用 getStats 分析选中的 candidate pair
+async function analyzeSelectedPair(pc) {
+  try {
+    const stats = await pc.getStats();
+    let selectedPair = null;
+    stats.forEach(r => {
+      if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.nominated) selectedPair = r;
+    });
+    if (!selectedPair) {
+      stats.forEach(r => {
+        if (r.type === 'candidate-pair' && r.state === 'succeeded') selectedPair = r;
+      });
+    }
+    if (!selectedPair) { log("[诊断] 未找到成功的候选者对"); return; }
+
+    let localCand = null, remoteCand = null;
+    stats.forEach(r => {
+      if (r.type === 'local-candidate' && r.id === selectedPair.localCandidateId) localCand = r;
+      if (r.type === 'remote-candidate' && r.id === selectedPair.remoteCandidateId) remoteCand = r;
+    });
+
+    const lt = localCand ? localCand.candidateType : 'unknown';
+    const rt = remoteCand ? remoteCand.candidateType : 'unknown';
+    log(`[诊断] 选中候选对: local=${lt} ↔ remote=${rt}`, null);
+
+    const banner = document.getElementById('path-banner');
+    const detail = `local:${lt} / remote:${rt}`;
+    if (lt === 'relay' || rt === 'relay') {
+      banner.className = 'turn';
+      banner.style.display = 'block';
+      banner.textContent = `🔄 使用了 TURN 中继 (${detail})`;
+      log(`[诊断] 结论: 使用 TURN 中继`);
+    } else {
+      banner.className = 'direct';
+      banner.style.display = 'block';
+      banner.textContent = `✅ 直连 P2P (${detail})`;
+      log(`[诊断] 结论: 直连 P2P`);
+    }
+  } catch (e) {
+    log("[诊断] getStats 错误: " + e.message);
+  }
+}
+
 function createPeerConnection() {
   pc = new RTCPeerConnection(iceConfig);
   localSdpSent = false;
 
   pc.onicecandidate = (ev) => {
     if (ev.candidate) {
+      const t = parseCandidateType(ev.candidate.candidate);
+      if (t) log(`本地候选者类型: ${t}`, t);
       socket.emit("signal", {
         roomId,
         type: "ice-candidate",
@@ -204,7 +264,10 @@ function createPeerConnection() {
     const state = pc.iceConnectionState;
     setStatus(state);
     log("iceConnectionState = " + state);
-    if (state === "connected" || state === "completed") enableChat();
+    if (state === "connected" || state === "completed") {
+      enableChat();
+      setTimeout(() => analyzeSelectedPair(pc), 500);
+    }
     if (state === "failed") addMSG("ICE 失败，可能需要更好的 TURN 或换网络", "info");
   };
 
@@ -275,6 +338,7 @@ document.getElementById("btn-join").onclick = async () => {
   setStatus("connecting…");
   offerHandled = false;
   pendingCandidates = [];
+  document.getElementById('path-banner').style.display = 'none';
 
   try {
     await connectSignaling(url);
