@@ -2,13 +2,13 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>JOIN WebRTC channel (Metered Realtime)</title>
+  <title>JOIN WebRTC channel (Socket.io)</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 720px; margin: 24px auto; padding: 0 16px; }
     h2 { margin-bottom: 8px; }
     #status { font-weight: normal; color: #666; }
     input[type=text] { width: 100%; box-sizing: border-box; padding: 8px; margin: 4px 0 12px; font-family: monospace; }
-    button { padding: 8px 16px; cursor: pointer; }
+    button { padding: 8px 16px; cursor: pointer; margin-right: 8px; }
     #chat { border: 1px solid #ccc; border-radius: 8px; overflow: hidden; margin-top: 16px; }
     #chat-screen-wp { height: 280px; overflow-y: auto; background: #fafafa; padding: 8px; }
     .wrap { margin: 6px 0; }
@@ -22,18 +22,19 @@
     .hint { font-size: 13px; color: #666; margin-bottom: 12px; }
     .log { font-size: 12px; color: #888; margin-top: 8px; white-space: pre-wrap; max-height: 160px; overflow-y: auto; }
   </style>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 </head>
 <body>
 <h2>JOIN WebRTC channel <span id="status">init</span></h2>
 <p class="hint">
-  双方填写<strong>相同房间号</strong>。本页点「加入房间」后会自动接收 Offer 并回复 Answer。
+  双方填写<strong>相同房间号</strong>。创建方先点「创建并等待」，你再点「加入」。
 </p>
 
-<label>API Key (pk_live_...)</label>
-<input type="text" id="api-key" placeholder="pk_live_xxxxxxxxxxxxxxxx" value="pk_live_814d2405fac2153e1872893be10bdd637233c5ac">
+<label>信令服务器地址</label>
+<input type="text" id="signal-url" value="https://preview-23e30aa938773200.up.railway.app">
 
-<label>房间号 (与创建方相同)</label>
-<input type="text" id="room-id" placeholder="例如 demo-room-123" value="demo-room-1">
+<label>房间号 (双方相同)</label>
+<input type="text" id="room-id" value="demo-room-1">
 
 <button id="btn-join">加入房间</button>
 
@@ -48,20 +49,38 @@
 <div class="log" id="log"></div>
 
 <script>
-const DEFAULT_API_KEY = "pk_live_814d2405fac2153e1872893be10bdd637233c5ac";
-
 let pc = null;
 let dc = null;
-let ws = null;
-let myPeerId = null;
-let roomChannel = null;
-let offerHandled = false;
+let socket = null;
+let roomId = null;
 let localSdpSent = false;
-let iceConfig = {
+let pendingCandidates = [];
+let offerHandled = false;
+
+const iceConfig = {
   iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun.miwifi.com:3478" },
-    { urls: "stun:stun.chat.bilibili.com:3478" }
+    { urls: "stun:stun.chat.bilibili.com:3478" },
+    {
+      urls: "turn:global.relay.metered.ca:80",
+      username: "3043870328f476eb7b83f1f5",
+      credential: "SqE9Pbn6+saRzOZS",
+    },
+    {
+      urls: "turn:global.relay.metered.ca:80?transport=tcp",
+      username: "3043870328f476eb7b83f1f5",
+      credential: "SqE9Pbn6+saRzOZS",
+    },
+    {
+      urls: "turn:global.relay.metered.ca:443",
+      username: "3043870328f476eb7b83f1f5",
+      credential: "SqE9Pbn6+saRzOZS",
+    },
+    {
+      urls: "turns:global.relay.metered.ca:443?transport=tcp",
+      username: "3043870328f476eb7b83f1f5",
+      credential: "SqE9Pbn6+saRzOZS",
+    },
   ]
 };
 
@@ -87,123 +106,151 @@ function enableChat() {
   document.getElementById("send").disabled = false;
 }
 
-function connectSignaling(apiKey, roomId) {
-  return new Promise((resolve, reject) => {
-    const url = `wss://rms.metered.ca/v1?key=${encodeURIComponent(apiKey)}`;
-    ws = new WebSocket(url);
-
-    ws.onopen = () => { setStatus("ws-open"); log("WebSocket opened"); };
-
-    ws.onmessage = (ev) => {
-      let msg;
-      try { msg = JSON.parse(ev.data); } catch (e) { return; }
-      log("← " + msg.type + (msg.data && msg.data.kind ? " (" + msg.data.kind + ")" : ""));
-
-      if (msg.type === "welcome") {
-        myPeerId = msg.peerId;
-        if (msg.metadata && Array.isArray(msg.metadata.iceServers) && msg.metadata.iceServers.length) {
-          iceConfig.iceServers = msg.metadata.iceServers;
-          log("using Metered iceServers (" + iceConfig.iceServers.length + ")");
-        }
-        setStatus("welcome " + myPeerId);
-        roomChannel = "webrtc-chat/" + roomId;
-        ws.send(JSON.stringify({ type: "subscribe", channel: roomChannel, requestId: "sub-1" }));
-      }
-
-      if (msg.type === "ack" && msg.requestId === "sub-1") {
-        setStatus("subscribed, waiting offer…");
-        log("subscribed to " + roomChannel);
-        addMSG("已加入房间，等待创建方发送 Offer…", "info");
-        resolve();
-      }
-
-      if (msg.type === "error") {
-        log("ERROR: " + (msg.message || msg.code));
-        addMSG("信令错误: " + (msg.message || msg.code), "info");
-      }
-
-      // 收到 Offer
-      if (msg.type === "message" && msg.data && msg.data.kind === "offer") {
-        if (offerHandled) {
-          log("duplicate offer ignored");
-          return;
-        }
-        offerHandled = true;
-        handleRemoteOffer(msg.data.sdp);
-      }
-    };
-
-    ws.onerror = (e) => { setStatus("ws-error"); log("ws error"); reject(e); };
-    ws.onclose = (e) => { setStatus("ws-closed " + e.code); log("ws closed " + e.code); };
-  });
+async function addRemoteCandidate(cand) {
+  if (!pc) {
+    pendingCandidates.push(cand);
+    log("queue candidate (no pc yet)");
+    return;
+  }
+  if (!pc.remoteDescription) {
+    pendingCandidates.push(cand);
+    log("queue candidate (no remoteDescription yet)");
+    return;
+  }
+  try {
+    await pc.addIceCandidate(new RTCIceCandidate(cand));
+  } catch (e) {
+    log("addIceCandidate error: " + e.message);
+  }
 }
 
-function publish(data) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({
-    type: "publish",
-    channel: roomChannel,
-    data: data,
-    requestId: "pub-" + Date.now()
-  }));
-  log("→ publish " + data.kind);
+async function flushPendingCandidates() {
+  while (pendingCandidates.length) {
+    const c = pendingCandidates.shift();
+    try {
+      await pc.addIceCandidate(new RTCIceCandidate(c));
+      log("flushed candidate");
+    } catch (e) {
+      log("flush candidate error: " + e.message);
+    }
+  }
+}
+
+function connectSignaling(url) {
+  return new Promise((resolve, reject) => {
+    socket = io(url, { transports: ["websocket", "polling"] });
+
+    socket.on("connect", () => {
+      setStatus("ws-open");
+      log("Socket connected: " + socket.id);
+      socket.emit("join", roomId);
+      addMSG("已加入房间，等待创建方发送 Offer…", "info");
+      resolve();
+    });
+
+    socket.on("connect_error", (err) => {
+      log("connect_error: " + err.message);
+      reject(err);
+    });
+
+    socket.on("disconnect", (reason) => {
+      setStatus("ws-closed");
+      log("disconnected: " + reason);
+    });
+
+    socket.on("peer-joined", ({ peerId }) => {
+      log("peer-joined: " + peerId);
+    });
+
+    socket.on("signal", async ({ from, type, data }) => {
+      log("← signal " + type + " from " + from);
+      if (type === "offer") {
+        await handleRemoteOffer(data);
+      } else if (type === "ice-candidate" && data) {
+        await addRemoteCandidate(data);
+      }
+    });
+  });
 }
 
 function sendLocalSdp(kind) {
   if (!pc || !pc.localDescription) return;
-  const sdp = JSON.stringify(pc.localDescription);
-  publish({ kind: kind, sdp: sdp, from: myPeerId });
+  socket.emit("signal", {
+    roomId,
+    type: kind,
+    data: pc.localDescription
+  });
   localSdpSent = true;
   setStatus(kind + " sent");
   addMSG(kind + " 已发送", "info");
+  log("→ " + kind);
 }
 
 function createPeerConnection() {
   pc = new RTCPeerConnection(iceConfig);
   localSdpSent = false;
 
+  pc.onicecandidate = (ev) => {
+    if (ev.candidate) {
+      socket.emit("signal", {
+        roomId,
+        type: "ice-candidate",
+        data: ev.candidate
+      });
+    }
+  };
+
   pc.oniceconnectionstatechange = () => {
     const state = pc.iceConnectionState;
     setStatus(state);
     log("iceConnectionState = " + state);
     if (state === "connected" || state === "completed") enableChat();
+    if (state === "failed") addMSG("ICE 失败，可能需要更好的 TURN 或换网络", "info");
   };
 
   pc.onicegatheringstatechange = () => {
     log("iceGatheringState = " + pc.iceGatheringState);
-    if (pc.iceGatheringState === "complete" && !localSdpSent) {
+    if (pc.iceGatheringState === "complete" && !localSdpSent && pc.localDescription && pc.localDescription.type === "answer") {
       sendLocalSdp("answer");
     }
   };
 
-  // 兜底：2 秒后强制发送 Answer
   setTimeout(() => {
-    if (!localSdpSent && pc && pc.localDescription) {
+    if (!localSdpSent && pc && pc.localDescription && pc.localDescription.type === "answer") {
       log("timeout → force send answer");
       sendLocalSdp("answer");
     }
   }, 2000);
 
-  pc.ondatachannel = (e) => {
-    dc = e.channel;
+  pc.ondatachannel = (ev) => {
+    dc = ev.channel;
     dc.onopen = () => { addMSG("CONNECTED!", "info"); enableChat(); log("DataChannel open"); };
-    dc.onmessage = (ev) => { if (ev.data) addMSG(ev.data, "other"); };
+    dc.onmessage = (e) => { if (e.data) addMSG(e.data, "other"); };
     dc.onclose = () => addMSG("DataChannel closed", "info");
   };
 }
 
-async function handleRemoteOffer(sdpStr) {
+async function handleRemoteOffer(sdp) {
+  if (offerHandled) {
+    log("ignore duplicate offer");
+    return;
+  }
+  offerHandled = true;
+  addMSG("已收到 Offer，正在生成 Answer…", "info");
+  if (pc) {
+    try { pc.close(); } catch (e) {}
+    pc = null;
+  }
   createPeerConnection();
   try {
-    const offerDesc = new RTCSessionDescription(JSON.parse(sdpStr));
-    await pc.setRemoteDescription(offerDesc);
+    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
     log("setRemoteDescription(offer) ok");
+    await flushPendingCandidates();
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     log("setLocalDescription(answer) done, waiting ICE…");
-    addMSG("已收到 Offer，正在生成 Answer…", "info");
-    // 发送由 icegatheringstatechange 或超时触发
   } catch (err) {
+    offerHandled = false;
     log("handleRemoteOffer failed: " + err.message);
     addMSG("处理 Offer 失败: " + err.message, "info");
   }
@@ -219,22 +266,21 @@ function sendMSG() {
 }
 
 document.getElementById("btn-join").onclick = async () => {
-  const apiKey = document.getElementById("api-key").value.trim() || DEFAULT_API_KEY;
-  const roomId = document.getElementById("room-id").value.trim();
+  const url = document.getElementById("signal-url").value.trim();
+  roomId = document.getElementById("room-id").value.trim();
   if (!roomId) { alert("请填写房间号"); return; }
-  if (apiKey.includes("REPLACE_ME")) {
-    alert("请先填写真实的 pk_live_... API Key（Dashboard 创建并勾选 Send）");
-    return;
-  }
+  if (!url) { alert("请填写信令服务器地址"); return; }
 
   document.getElementById("btn-join").disabled = true;
   setStatus("connecting…");
+  offerHandled = false;
+  pendingCandidates = [];
 
   try {
-    await connectSignaling(apiKey, roomId);
+    await connectSignaling(url);
   } catch (e) {
     setStatus("failed");
-    addMSG("连接信令失败，请检查 API Key 和网络", "info");
+    addMSG("连接信令失败: " + (e.message || e), "info");
     document.getElementById("btn-join").disabled = false;
   }
 };
